@@ -81,7 +81,6 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         config.get(CONF_NAME) or config.get(CONF_USERNAME),
         config.get(CONF_SENDERS),
         value_template,
-        config.get(CONF_CSV_FILENAME),
     )
 
     if sensor.connected:
