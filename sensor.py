@@ -293,11 +293,12 @@ class EmailContentSensor(Entity):
             attachment = email_message.get_payload()[i]
             _LOGGER.info('Attachment:')
             if hasattr(attachment, 'get_filename') and callable(attachment.get_filename):
-                _LOGGER.info('Is Attachment')
                 filename = attachment.get_filename()
                 fullpath = os.path.join(storage_path, filename)
                 open(fullpath, 'wb').write(attachment.get_payload(decode=True))
                 attachments.append(fullpath)
+                _LOGGER.info('Is Attachment')
+                _LOGGER.info(fullpath)
             else:
                 _LOGGER.info('NoAttachment')
 
