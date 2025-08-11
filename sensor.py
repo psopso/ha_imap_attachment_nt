@@ -5,6 +5,7 @@ import email
 import imaplib
 import logging
 import os
+import pandas as pd
 
 import voluptuous as vol
 
@@ -27,6 +28,7 @@ CONF_SERVER = "server"
 CONF_SENDERS = "senders"
 CONF_FOLDER = "folder"
 CONF_STORAGE_PATH = "storage_path"
+CONF_CSV_FILENAME = "csv_filename"
 
 ATTR_FROM = "from"
 ATTR_BODY = "body"
@@ -47,6 +49,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
         vol.Optional(CONF_FOLDER, default="INBOX"): cv.string,
         vol.Optional(CONF_STORAGE_PATH, default="/config/attachments"): cv.string,
+        vol.Optional(CONF_CSV_FILENAME, default="tariff.save"): cv.string,
     }
 )
 
@@ -60,11 +63,14 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         config.get(CONF_PORT),
         config.get(CONF_FOLDER),
         config.get(CONF_STORAGE_PATH),
+        config.get(CONF_CSV_FILENAME),
     )
 
     storage_path = config.get(CONF_STORAGE_PATH)
     if not os.path.exists(storage_path):
         os.makedirs(storage_path)
+
+    csv_filename = config.get(CONF_CSV_FILENAME)
 
     value_template = config.get(CONF_VALUE_TEMPLATE)
     if value_template is not None:
@@ -75,7 +81,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         config.get(CONF_NAME) or config.get(CONF_USERNAME),
         config.get(CONF_SENDERS),
         value_template,
-        config.get(CONF_STORAGE_PATH),
+        config.get(CONF_CSV_FILENAME),
     )
 
     if sensor.connected:
@@ -87,7 +93,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 class EmailReader:
     """A class to read emails from an IMAP server."""
 
-    def __init__(self, user, password, server, port, folder, storage_path):
+    def __init__(self, user, password, server, port, folder, storage_path, csv_filename):
         """Initialize the Email Reader."""
         self._user = user
         self._password = password
@@ -97,6 +103,7 @@ class EmailReader:
         self._last_id = None
         self._unread_ids = deque([])
         self._storage_path = storage_path
+        self._csv_filename = csv_filename
         self.connection = None
         self._message_data = None
         self._last_uid = None
@@ -184,7 +191,7 @@ class EmailReader:
 class EmailContentSensor(Entity):
     """Representation of an EMail sensor."""
 
-    def __init__(self, hass, email_reader, name, allowed_senders, value_template, storage_path):
+    def __init__(self, hass, email_reader, name, allowed_senders, value_template, storage_path, csv_filename):
         """Initialize the sensor."""
         self.hass = hass
         self._email_reader = email_reader
@@ -192,6 +199,7 @@ class EmailContentSensor(Entity):
         self._allowed_senders = [sender.upper() for sender in allowed_senders]
         self._value_template = value_template
         self._storage_path = storage_path
+        self._csv_filename = csv_filename
         self._last_id = None
         self._message = None
         self._state_attributes = None
@@ -299,6 +307,8 @@ class EmailContentSensor(Entity):
                 attachments.append(fullpath)
                 _LOGGER.info('Is Attachment')
                 _LOGGER.info(fullpath)
+                #read_file = pd.read_excel("Test.xlsx")
+                #read_file.to_csv("Test.csv", index=None, header=True)
             else:
                 _LOGGER.info('NoAttachment')
 
