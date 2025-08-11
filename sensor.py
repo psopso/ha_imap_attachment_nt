@@ -229,7 +229,7 @@ class EmailContentSensor(Entity):
             ATTR_DATE: email_message["Date"],
             ATTR_BODY: EmailContentSensor.get_msg_text(email_message),
             ATTR_NUM_ATTACHMENTS: EmailContentSensor.get_num_msg_attachments(email_message),
-            ATTR_ATTACHMENT_PATHS: EmailContentSensor.get_msg_attachments(email_message, self._storage_path),
+            ATTR_ATTACHMENT_PATHS: EmailContentSensor.get_msg_attachments(email_message, self._storage_path, self._csv_filename),
         }
         return self._value_template.render(variables, parse_result=False)
 
@@ -292,7 +292,7 @@ class EmailContentSensor(Entity):
         return len(email_message.get_payload()) - 1
 
     @staticmethod
-    def get_msg_attachments(email_message, storage_path):
+    def get_msg_attachments(email_message, storage_path, csv_filename):
         """
         Parse attachments on the email.
         Store the files locally and return a list of paths.
@@ -308,6 +308,7 @@ class EmailContentSensor(Entity):
                 attachments.append(fullpath)
                 _LOGGER.info('Is Attachment')
                 _LOGGER.info(fullpath)
+                _LOGGER.info(csv_filename);
                 #read_file = pd.read_excel("Test.xlsx")
                 #read_file.to_csv("Test.csv", index=None, header=True)
             else:
