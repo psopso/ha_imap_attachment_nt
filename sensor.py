@@ -342,7 +342,7 @@ class EmailContentSensor(Entity):
                 ATTR_DATE: email_message["Date"],
                 ATTR_BODY: EmailContentSensor.get_msg_text(email_message),
                 ATTR_NUM_ATTACHMENTS: EmailContentSensor.get_num_msg_attachments(email_message),
-                ATTR_ATTACHMENT_PATHS: EmailContentSensor.get_msg_attachments(email_message, self._storage_path),
+                ATTR_ATTACHMENT_PATHS: EmailContentSensor.get_msg_attachments(email_message, self._storage_path, self._csv_filename),
             }
 
             _LOGGER.info('Smazat zprávu: ' + str(self._email_reader._last_id))
