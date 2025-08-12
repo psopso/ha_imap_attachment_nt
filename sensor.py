@@ -310,8 +310,8 @@ class EmailContentSensor(Entity):
                 _LOGGER.info(fullpath)
                 _LOGGER.info('Filename');
                 _LOGGER.info(storage_path+'/'+csv_filename);
-                #read_file = pd.read_excel(storage_path+'/'+csv_filename)
-                #read_file.to_csv("Test.csv", index=None, header=True)
+                read_file = pd.read_excel(fullpath)
+                read_file.to_csv(storage_path+'/'+csv_filename, index=None, header=True)
             else:
                 _LOGGER.info('NoAttachment')
 
