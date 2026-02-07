@@ -400,6 +400,7 @@ class EmailContentSensor(Entity):
                 # self._email_reader.connection.expunge()
                 self._email_reader.connection.uid("COPY", self._email_reader._last_uid, '"[Gmail]/Trash"')
                 self._email_reader.connection.uid("STORE", self._email_reader._last_uid, "+FLAGS", r"(\Deleted)")
+                self._email_reader.connection.expunge()
 
             except Exception as e:
                 _LOGGER.warning(f"Could not delete email: {e}")
