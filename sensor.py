@@ -208,7 +208,7 @@ class EmailContentSensor(Entity):
         self._csv_filename = csv_filename
         self._last_id = None
         self._message = None
-        self._attr_extra_state_attributes = { "pokus": "1111"}
+        self._attr_extra_state_attributes = {}
         self.connected = self._email_reader.connect()
         self._state = None
 
