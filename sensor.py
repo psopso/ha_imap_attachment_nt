@@ -22,6 +22,10 @@ from homeassistant.const import (
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
 
+import unicodedata
+import re
+from email.header import decode_header, make_header
+
 _LOGGER = logging.getLogger(__name__)
 
 CONF_SERVER = "server"
@@ -141,7 +145,7 @@ class EmailReader:
         try:
             message_uid = None
             self.connection.select(self._folder, readonly=True)
-
+            _LOGGER.info('read_next')
             if not self._unread_ids:
                 search = f'(SINCE {datetime.date.today():%d-%b-%Y} SUBJECT "Export" SUBJECT "NT")'
                 if self._last_id is not None:
@@ -152,10 +156,11 @@ class EmailReader:
 
             while self._unread_ids:
                 message_uid = self._unread_ids.popleft()
+                _LOGGER.info('messageuid:')
                 if self._last_id is None or int(message_uid) > self._last_id:
                     self._last_id = int(message_uid)
                     self._last_uid = message_uid
-                    #_LOGGER.info('Next message: ' + message_uid.decode("ascii"))
+                    _LOGGER.info('Next message: ' + message_uid.decode("ascii"))
                     #self.connection.uid("COPY", message_uid, '"[Gmail]/Trash"')
                     #self.connection.uid("STORE", message_uid, "+FLAGS", r"(\Deleted)")
                     return self._fetch_message(message_uid)
@@ -222,6 +227,7 @@ class EmailContentSensor(Entity):
         return self._state_attributes
 
     def render_template(self, email_message):
+        _LOGGER.info('rendertemplate')
         """Render the message template."""
         variables = {
             ATTR_FROM: EmailContentSensor.get_msg_sender(email_message),
@@ -294,29 +300,67 @@ class EmailContentSensor(Entity):
     @staticmethod
     def get_msg_attachments(email_message, storage_path, csv_filename):
         """
-        Parse attachments on the email.
-        Store the files locally and return a list of paths.
+        Parse attachments on the email, clean filenames and store locally.
         """
         attachments = []
-        for i in range(1, len(email_message.get_payload())):
-            attachment = email_message.get_payload()[i]
-            _LOGGER.info('Attachment:')
-            if hasattr(attachment, 'get_filename') and callable(attachment.get_filename):
-                filename = attachment.get_filename()
-                fullpath = os.path.join(storage_path, filename)
-                open(fullpath, 'wb').write(attachment.get_payload(decode=True))
-                attachments.append(fullpath)
-                _LOGGER.info('Is Attachment')
-                _LOGGER.info(fullpath)
-                _LOGGER.info('Filename');
-                _LOGGER.info(storage_path+'/'+csv_filename);
-                read_file = pd.read_excel(fullpath)
-                read_file.to_csv(storage_path+'/'+csv_filename, index=None, header=True, sep=';')
-            else:
-                _LOGGER.info('NoAttachment')
+        
+        for part in email_message.walk():
+            if part.get_content_maintype() == 'multipart':
+                continue
+
+            filename = part.get_filename()
+
+            if filename:
+                # 1. DEKÓDOVÁNÍ (z MIME formátu =?utf-8?Q?...)
+                try:
+                    # decode_header vrací seznam dvojic (bytes, encoding)
+                    decoded_header = decode_header(filename)
+                    # make_header to spojí do jednoho objektu, str() to převede na čitelný řetězec
+                    filename = str(make_header(decoded_header))
+                except Exception as e:
+                    _LOGGER.warning(f"Error decoding header: {e}")
+                    # Pokud selže, necháme původní název
+
+                # 2. ODSTRANĚNÍ ČEŠTINY A VYČIŠTĚNÍ
+                # Normalizace rozdělí znaky (např. 'č' na 'c' + háček)
+                normalized = unicodedata.normalize('NFKD', filename)
+                # Encode do ASCII zahodí (ignore) znaky, co nejsou ASCII (tím zmizí háčky/čárky)
+                filename_ascii = normalized.encode('ASCII', 'ignore').decode('ASCII')
+                # Regulární výraz: povolí jen písmena, čísla, tečku, pomlčku a podtržítko
+                # Vše ostatní (včetně mezer) nahradí podtržítkem nebo odstraní
+                filename_clean = re.sub(r'[^\w\.-]', '_', filename_ascii)
+                
+                # Odstranění vícenásobných podtržítek vzniklých čištěním
+                filename_clean = re.sub(r'_+', '_', filename_clean)
+
+                _LOGGER.info(f'Original filename: {filename} -> Cleaned: {filename_clean}')
+
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+
+                fullpath = os.path.join(storage_path, filename_clean)
+                
+                try:
+                    with open(fullpath, 'wb') as f:
+                        f.write(payload)
+                    
+                    attachments.append(fullpath)
+
+                    # Logika pro Pandas (Excel -> CSV)
+                    if filename_clean.lower().endswith(('.xls', '.xlsx')):
+                        try:
+                            # POZOR: Pandas musí číst ten nový "vyčištěný" název souboru
+                            read_file = pd.read_excel(fullpath)
+                            output_csv_path = os.path.join(storage_path, csv_filename)
+                            read_file.to_csv(output_csv_path, index=None, header=True, sep=';')
+                        except Exception as e:
+                            _LOGGER.error(f"Pandas conversion failed: {e}")
+
+                except Exception as e:
+                    _LOGGER.error(f"Failed to save file {fullpath}: {e}")
 
         return attachments
-
 
     def update(self):
         _LOGGER.info('Update emails')
