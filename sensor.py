@@ -208,8 +208,9 @@ class EmailContentSensor(Entity):
         self._csv_filename = csv_filename
         self._last_id = None
         self._message = None
-        self._state_attributes = None
+        self._attr_extra_state_attributes = { "pokus": "1111"}
         self.connected = self._email_reader.connect()
+        self._state = None
 
     @property
     def name(self):
@@ -221,10 +222,6 @@ class EmailContentSensor(Entity):
         """Return the current email state."""
         return self._message
 
-    @property
-    def device_state_attributes(self):
-        """Return other state attributes for the message."""
-        return self._state_attributes
 
     def render_template(self, email_message):
         _LOGGER.info('rendertemplate')
@@ -362,35 +359,47 @@ class EmailContentSensor(Entity):
 
         return attachments
 
+
     def update(self):
-        _LOGGER.info('Update emails')
-        """Read emails and publish state change."""
+        _LOGGER.info('Update emails started')
         email_message = self._email_reader.read_next()
 
         if email_message is None:
-            self._message = None
-            self._state_attributes = {}
+            # Necháme stav, jaký byl, nebo nastavíme prázdné
             return
 
         if self.sender_allowed(email_message):
-            message = EmailContentSensor.get_msg_subject(email_message)
+            # Zpracování textu/šablony
+            message_subject = EmailContentSensor.get_msg_subject(email_message)
+            
+            # Uložíme si cesty k přílohám jednou, ať nevoláme náročný Pandas 2x
+            paths = EmailContentSensor.get_msg_attachments(email_message, self._storage_path, self._csv_filename)
 
             if self._value_template is not None:
-                message = self.render_template(email_message)
-            _LOGGER.info('Message')
-            #_LOGGER.info(message)
-            self._message = message
-            self._state_attributes = {
+                message_state = self.render_template(email_message)
+            else:
+                message_state = message_subject
+
+            self._message = message_state
+            
+            # Naplnění atributů
+            self._attr_extra_state_attributes = {
                 ATTR_FROM: EmailContentSensor.get_msg_sender(email_message),
-                ATTR_SUBJECT: EmailContentSensor.get_msg_subject(email_message),
+                ATTR_SUBJECT: message_subject,
                 ATTR_DATE: email_message["Date"],
-                ATTR_BODY: EmailContentSensor.get_msg_text(email_message),
                 ATTR_NUM_ATTACHMENTS: EmailContentSensor.get_num_msg_attachments(email_message),
-                ATTR_ATTACHMENT_PATHS: EmailContentSensor.get_msg_attachments(email_message, self._storage_path, self._csv_filename),
+                ATTR_ATTACHMENT_PATHS: paths,
             }
+            #ATTR_BODY: EmailContentSensor.get_msg_text(email_message),
 
-            _LOGGER.info('Smazat zprávu: ' + str(self._email_reader._last_id))
-            self._email_reader.connection.uid("COPY", self._email_reader._last_uid, '"[Gmail]/Trash"')
-            self._email_reader.connection.uid("STORE", self._email_reader._last_uid, "+FLAGS", r"(\Deleted)")
-            #self._email_reader.connection.store(message, "+FLAGS", "\\Deleted")
+            # Bezpečné smazání/přesun - zabaleno do try-except, aby nezpůsobilo "Error" sensoru
+            try:
+                _LOGGER.info(f'Deleting message UID: {self._email_reader._last_uid}')
+                # Zkusíme označit jako smazané (nejuniverzálnější metoda)
+                # self._email_reader.connection.uid("STORE", self._email_reader._last_uid, "+FLAGS", r"(\Deleted)")
+                # self._email_reader.connection.expunge()
+                self._email_reader.connection.uid("COPY", self._email_reader._last_uid, '"[Gmail]/Trash"')
+                self._email_reader.connection.uid("STORE", self._email_reader._last_uid, "+FLAGS", r"(\Deleted)")
 
+            except Exception as e:
+                _LOGGER.warning(f"Could not delete email: {e}")
