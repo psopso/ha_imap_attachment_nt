@@ -167,7 +167,7 @@ class EmailReader:
                 #self.connection.uid("STORE", message_uid, "+FLAGS", r"(\Deleted)")
                 #_LOGGER.info('Message deleted?: ' + message_uid.decode("ascii"))
 
-                #status1, data1 = self.connection.uid("fetch", message_uid, '(FLAGS)')
+                status1, data1 = self.connection.uid("fetch", message_uid, '(FLAGS)')
                 _LOGGER.info(data1);
 
             self.connection.expunge()
