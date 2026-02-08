@@ -1,7 +1,7 @@
 {
   "domain": "imap_attachment_nt",
   "name": "IMAP Attachment Sensor",
-  "documentation": "https://github.com/emcniece/ha_imap_attachment",
+  "documentation": "https://github.com/psopso/ha_imap_attachment_nt",
   "requirements": ["pandas", "openpyxl", "xlrd"],
   "codeowners": ["@psopso"],
   "version": "2026.02.08"
