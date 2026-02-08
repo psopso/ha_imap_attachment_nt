@@ -1,46 +1,39 @@
-"""Email attachment sensor support."""
-from collections import deque
-import datetime
-import email
-import imaplib
+"""Email attachment sensor support with Tariff Logic and Throttling."""
 import logging
 import os
-import pandas as pd
+import json
+import re
+import datetime
+import imaplib
+import email
+import unicodedata
+from email.header import decode_header, make_header
 
 import voluptuous as vol
+import pandas as pd
 
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 from homeassistant.const import (
-    ATTR_DATE,
     CONF_NAME,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_USERNAME,
     CONF_VALUE_TEMPLATE,
-    CONTENT_TYPE_TEXT_PLAIN,
 )
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
 
-import unicodedata
-import re
-from email.header import decode_header, make_header
-
 _LOGGER = logging.getLogger(__name__)
 
+# --- KONFIGURACE ---
 CONF_SERVER = "server"
 CONF_SENDERS = "senders"
 CONF_FOLDER = "folder"
 CONF_STORAGE_PATH = "storage_path"
-CONF_CSV_FILENAME = "csv_filename"
-
-ATTR_FROM = "from"
-ATTR_BODY = "body"
-ATTR_SUBJECT = "subject"
-ATTR_NUM_ATTACHMENTS = "num_attachments"
-ATTR_ATTACHMENT_PATHS = "attachment_paths"
+CONF_EMAIL_INTERVAL = "email_interval_minutes"
 
 DEFAULT_PORT = 993
+DEFAULT_EMAIL_INTERVAL = 60 # Kontrola emailu jednou za hodinu
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
@@ -53,354 +46,325 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
         vol.Optional(CONF_FOLDER, default="INBOX"): cv.string,
         vol.Optional(CONF_STORAGE_PATH, default="/config/attachments"): cv.string,
-        vol.Optional(CONF_CSV_FILENAME, default="tariff.save"): cv.string,
+        vol.Optional(CONF_EMAIL_INTERVAL, default=DEFAULT_EMAIL_INTERVAL): cv.positive_int,
     }
 )
 
-
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Email sensor platform."""
+    storage_path = config.get(CONF_STORAGE_PATH)
+    if not os.path.exists(storage_path):
+        os.makedirs(storage_path)
+
+    processor = TariffProcessor(storage_path)
+    
     reader = EmailReader(
         config.get(CONF_USERNAME),
         config.get(CONF_PASSWORD),
         config.get(CONF_SERVER),
         config.get(CONF_PORT),
         config.get(CONF_FOLDER),
-        config.get(CONF_STORAGE_PATH),
-        config.get(CONF_CSV_FILENAME),
+        storage_path,
+        processor 
     )
 
-    storage_path = config.get(CONF_STORAGE_PATH)
-    if not os.path.exists(storage_path):
-        os.makedirs(storage_path)
-
-    csv_filename = config.get(CONF_CSV_FILENAME)
-
-    value_template = config.get(CONF_VALUE_TEMPLATE)
-    if value_template is not None:
-        value_template.hass = hass
     sensor = EmailContentSensor(
         hass,
         reader,
-        config.get(CONF_NAME) or config.get(CONF_USERNAME),
+        processor,
+        config.get(CONF_NAME) or "Tariff Sensor",
         config.get(CONF_SENDERS),
-        value_template,
-        config.get(CONF_STORAGE_PATH),
-        config.get(CONF_CSV_FILENAME),
+        config.get(CONF_EMAIL_INTERVAL)
     )
 
-    if sensor.connected:
-        add_entities([sensor], True)
-    else:
-        return False
+    # OPRAVA: Odstraněna podmínka "if sensor.connected", která způsobovala chybu.
+    # Sensor se přidá vždy, připojení se řeší až v metodě update().
+    add_entities([sensor], True)
+
+
+class TariffProcessor:
+    """Třída pro zpracování Excelu a výpočet stavu tarifu (Lokální data)."""
+
+    def __init__(self, storage_path):
+        self.storage_path = storage_path
+        self.json_file = os.path.join(storage_path, "tariff_data.json")
+        
+        self.days_map = {
+            'Pondělí': 0, 'Úterý': 1, 'Středa': 2, 'Čtvrtek': 3, 
+            'Pátek': 4, 'Sobota': 5, 'Neděle': 6
+        }
+
+    def process_excel(self, excel_path):
+        """Načte Excel, vyfiltruje data a uloží je jako JSON."""
+        try:
+            _LOGGER.info(f"Processing Excel: {excel_path}")
+            df = pd.read_excel(excel_path)
+            
+            if df.empty:
+                return False
+
+            # Filtrujeme řádky, kde první sloupec končí na '|1' (NT)
+            mask = df.iloc[:, 0].astype(str).str.strip().str.endswith('|1')
+            df_filtered = df[mask]
+
+            tariff_schedule = {}
+
+            for _, row in df_filtered.iterrows():
+                day_name = row.iloc[2] # Sloupec Platnost
+                if day_name not in self.days_map:
+                    continue
+                
+                day_idx = self.days_map[day_name]
+                intervals = []
+
+                # Procházíme sloupce s časy po dvojicích
+                for i in range(3, 13, 2):
+                    try:
+                        start = row.iloc[i]
+                        end = row.iloc[i+1]
+                        
+                        if pd.notna(start) and pd.notna(end):
+                            s_str = str(start).strip()
+                            e_str = str(end).strip()
+                            if s_str and e_str and s_str != 'nan':
+                                intervals.append((s_str, e_str))
+                    except IndexError:
+                        break
+                
+                tariff_schedule[day_idx] = intervals
+
+            with open(self.json_file, 'w') as f:
+                json.dump(tariff_schedule, f, indent=4)
+            
+            _LOGGER.info("Tariff data saved successfully to JSON.")
+            return True
+
+        except Exception as e:
+            _LOGGER.error(f"Failed to process Excel: {e}")
+            return False
+
+    def get_current_state(self):
+        """Vypočítá, zda jsme v NT a jaký je aktuální/příští interval."""
+        if not os.path.exists(self.json_file):
+            return "Unknown", "Waiting for data (JSON missing)"
+
+        try:
+            with open(self.json_file, 'r') as f:
+                data = json.load(f)
+        except Exception:
+            return "Unknown", "Error reading JSON data"
+
+        now = datetime.datetime.now()
+        current_day = now.weekday()
+        
+        def to_mins(t_str):
+            if t_str == "24:00": return 1440
+            try:
+                h, m = map(int, t_str.split(':'))
+                return h * 60 + m
+            except:
+                return 0
+
+        current_mins = to_mins(now.strftime("%H:%M"))
+
+        # --- LOGIKA SPOJOVÁNÍ INTERVALŮ ---
+        timeline = []
+        for day_offset in [-1, 0, 1]:
+            target_day_idx = (current_day + day_offset) % 7
+            key = str(target_day_idx)
+            
+            if key in data:
+                offset_mins = day_offset * 1440
+                for start_s, end_s in data[key]:
+                    s_m = to_mins(start_s) + offset_mins
+                    e_m = to_mins(end_s) + offset_mins
+                    timeline.append({'start': s_m, 'end': e_m})
+
+        timeline.sort(key=lambda x: x['start'])
+
+        # Sloučení
+        merged = []
+        if timeline:
+            curr = timeline[0]
+            for i in range(1, len(timeline)):
+                if timeline[i]['start'] <= curr['end']:
+                    curr['end'] = max(curr['end'], timeline[i]['end'])
+                else:
+                    merged.append(curr)
+                    curr = timeline[i]
+            merged.append(curr)
+
+        # Vyhodnocení
+        active_interval = None
+        next_interval = None
+
+        for item in merged:
+            if item['start'] <= current_mins < item['end']:
+                active_interval = item
+                break
+            if item['start'] > current_mins:
+                next_interval = item
+                break
+
+        def min_to_hm(m):
+            d = 0
+            if m >= 1440: d = 1; m -= 1440
+            elif m < 0: d = -1; m += 1440
+            t = f"{m//60:02d}:{m%60:02d}"
+            if d == 1: return f"Zítra {t}"
+            if d == -1: return f"Včera {t}"
+            return t
+
+        if active_interval:
+            return "NT", f"{min_to_hm(active_interval['start'])} - {min_to_hm(active_interval['end'])}"
+        elif next_interval:
+            return "VT", f"Příští NT: {min_to_hm(next_interval['start'])} - {min_to_hm(next_interval['end'])}"
+        
+        return "VT", "Žádný další NT v dohledu"
 
 
 class EmailReader:
-    """A class to read emails from an IMAP server."""
+    """Třída pro komunikaci s IMAP."""
 
-    def __init__(self, user, password, server, port, folder, storage_path, csv_filename):
-        """Initialize the Email Reader."""
+    def __init__(self, user, password, server, port, folder, storage_path, processor):
         self._user = user
         self._password = password
         self._server = server
         self._port = port
         self._folder = folder
-        self._last_id = None
-        self._unread_ids = deque([])
         self._storage_path = storage_path
-        self._csv_filename = csv_filename
+        self._processor = processor
         self.connection = None
-        self._message_data = None
         self._last_uid = None
 
     def connect(self):
-        """Login and setup the connection."""
         try:
             self.connection = imaplib.IMAP4_SSL(self._server, self._port)
             self.connection.login(self._user, self._password)
             return True
-        except imaplib.IMAP4.error:
-            _LOGGER.error("Failed to login to %s", self._server)
+        except Exception as e:
+            _LOGGER.error(f"Failed to login: {e}")
             return False
 
-    def _fetch_message(self, message_uid):
-        """Get an email message from a message id."""
-        _, message_data = self.connection.uid("fetch", message_uid, "(RFC822)")
+    def check_for_emails(self):
+        """Připojí se, stáhne emaily, uloží přílohy a odpojí se."""
+        _LOGGER.info("Connecting to IMAP to check for new emails...")
+        if not self.connect():
+            return False
 
-        if message_data is None:
-            return None
-        if message_data[0] is None:
-            return None
-
-        self._message_data = message_data
-        #_LOGGER.info(message_data)
-
-        raw_email = message_data[0][1]
-        email_message = email.message_from_bytes(raw_email)
-
-        return email_message
-
-    def read_next(self):
-        """Read the next email from the email server."""
         try:
-            message_uid = None
-            self.connection.select(self._folder, readonly=True)
-            _LOGGER.info('read_next')
-            if not self._unread_ids:
-                search = f'(SINCE {datetime.date.today():%d-%b-%Y} SUBJECT "Export" SUBJECT "NT")'
-                if self._last_id is not None:
-                    search = f'(UID {self._last_id}:* SUBJECT "Export")'
-
-                _, data = self.connection.uid("search", None, search)
-                self._unread_ids = deque(data[0].split())
-
-            while self._unread_ids:
-                message_uid = self._unread_ids.popleft()
-                _LOGGER.info('messageuid:')
-                if self._last_id is None or int(message_uid) > self._last_id:
-                    self._last_id = int(message_uid)
-                    self._last_uid = message_uid
-                    _LOGGER.info('Next message: ' + message_uid.decode("ascii"))
-                    #self.connection.uid("COPY", message_uid, '"[Gmail]/Trash"')
-                    #self.connection.uid("STORE", message_uid, "+FLAGS", r"(\Deleted)")
-                    return self._fetch_message(message_uid)
+            self.connection.select(self._folder, readonly=False)
+            search_crit = '(SUBJECT "Export" UNSEEN)'
             
-            if message_uid is not None:
-                self._last_uid = message_uid
-                #_LOGGER.info('Next message: ' + message_uid.decode("ascii"))
-                #self.connection.uid("COPY", message_uid, '"[Gmail]/Trash"')
-                #self.connection.uid("STORE", message_uid, "+FLAGS", r"(\Deleted)")
-                #_LOGGER.info('Message deleted?: ' + message_uid.decode("ascii"))
+            _, data = self.connection.uid("search", None, search_crit)
+            uids = data[0].split()
 
-                status1, data1 = self.connection.uid("fetch", message_uid, '(FLAGS)')
-                _LOGGER.info(data1);
+            if not uids:
+                _LOGGER.info("No new emails found.")
+                self.connection.logout()
+                return False
 
-            self.connection.expunge()
+            self._last_uid = uids[-1]
+            _, msg_data = self.connection.uid("fetch", self._last_uid, "(RFC822)")
+            
+            if msg_data and msg_data[0]:
+                raw_email = msg_data[0][1]
+                email_message = email.message_from_bytes(raw_email)
+                
+                self._save_attachments(email_message)
 
-            return self._fetch_message(str(self._last_id))
+                try:
+                    self.connection.uid("STORE", self._last_uid, "+FLAGS", r"(\Deleted)")
+                    self.connection.expunge()
+                    _LOGGER.info("Email processed and deleted.")
+                except Exception as e:
+                    _LOGGER.warning(f"Delete failed: {e}")
 
-        except imaplib.IMAP4.error:
-            _LOGGER.info("Connection to %s lost, attempting to reconnect", self._server)
+            self.connection.logout()
+            return True
+
+        except Exception as e:
+            _LOGGER.error(f"Error during email check: {e}")
             try:
-                self.connect()
-                _LOGGER.info(
-                    "Reconnect to %s succeeded, trying last message", self._server
-                )
-                if self._last_id is not None:
-                    return self._fetch_message(str(self._last_id))
-            except imaplib.IMAP4.error:
-                _LOGGER.error("Failed to reconnect")
+                self.connection.logout()
+            except:
+                pass
+            return False
 
-        return None
-
-
-class EmailContentSensor(Entity):
-    """Representation of an EMail sensor."""
-
-    def __init__(self, hass, email_reader, name, allowed_senders, value_template, storage_path, csv_filename):
-        """Initialize the sensor."""
-        self.hass = hass
-        self._email_reader = email_reader
-        self._name = name
-        self._allowed_senders = [sender.upper() for sender in allowed_senders]
-        self._value_template = value_template
-        self._storage_path = storage_path
-        self._csv_filename = csv_filename
-        self._last_id = None
-        self._message = None
-        self._attr_extra_state_attributes = {}
-        self.connected = self._email_reader.connect()
-        self._state = None
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def state(self):
-        """Return the current email state."""
-        return self._message
-
-
-    def render_template(self, email_message):
-        _LOGGER.info('rendertemplate')
-        """Render the message template."""
-        variables = {
-            ATTR_FROM: EmailContentSensor.get_msg_sender(email_message),
-            ATTR_SUBJECT: EmailContentSensor.get_msg_subject(email_message),
-            ATTR_DATE: email_message["Date"],
-            ATTR_BODY: EmailContentSensor.get_msg_text(email_message),
-            ATTR_NUM_ATTACHMENTS: EmailContentSensor.get_num_msg_attachments(email_message),
-            ATTR_ATTACHMENT_PATHS: EmailContentSensor.get_msg_attachments(email_message, self._storage_path, self._csv_filename),
-        }
-        return self._value_template.render(variables, parse_result=False)
-
-    def sender_allowed(self, email_message):
-        """Check if the sender is in the allowed senders list."""
-        return EmailContentSensor.get_msg_sender(email_message).upper() in (
-            sender for sender in self._allowed_senders
-        )
-
-    @staticmethod
-    def get_msg_sender(email_message):
-        """Get the parsed message sender from the email."""
-        return str(email.utils.parseaddr(email_message["From"])[1])
-
-    @staticmethod
-    def get_msg_subject(email_message):
-        """Decode the message subject."""
-        decoded_header = email.header.decode_header(email_message["Subject"])
-        header = email.header.make_header(decoded_header)
-        return str(header)
-
-    @staticmethod
-    def get_msg_text(email_message):
-        """
-        Get the message text from the email.
-        Will look for text/plain or use text/html if not found.
-        """
-        message_text = None
-        message_html = None
-        message_untyped_text = None
-
-        for part in email_message.walk():
-            if part.get_content_type() == CONTENT_TYPE_TEXT_PLAIN:
-                if message_text is None:
-                    message_text = part.get_payload()
-            elif part.get_content_type() == "text/html":
-                if message_html is None:
-                    message_html = part.get_payload()
-            elif part.get_content_type().startswith("text"):
-                if message_untyped_text is None:
-                    message_untyped_text = part.get_payload()
-
-        if message_text is not None:
-            return message_text
-
-        if message_html is not None:
-            return message_html
-
-        if message_untyped_text is not None:
-            return message_untyped_text
-
-        return email_message.get_payload()
-
-    @staticmethod
-    def get_num_msg_attachments(email_message):
-        """
-        Detect number of attachments.
-        First index is the email body.
-        """
-        return len(email_message.get_payload()) - 1
-
-    @staticmethod
-    def get_msg_attachments(email_message, storage_path, csv_filename):
-        """
-        Parse attachments on the email, clean filenames and store locally.
-        """
-        attachments = []
-        
+    def _save_attachments(self, email_message):
+        """Interní metoda pro uložení příloh."""
         for part in email_message.walk():
             if part.get_content_maintype() == 'multipart':
                 continue
 
             filename = part.get_filename()
-
             if filename:
-                # 1. DEKÓDOVÁNÍ (z MIME formátu =?utf-8?Q?...)
                 try:
-                    # decode_header vrací seznam dvojic (bytes, encoding)
-                    decoded_header = decode_header(filename)
-                    # make_header to spojí do jednoho objektu, str() to převede na čitelný řetězec
-                    filename = str(make_header(decoded_header))
-                except Exception as e:
-                    _LOGGER.warning(f"Error decoding header: {e}")
-                    # Pokud selže, necháme původní název
+                    filename = str(make_header(decode_header(filename)))
+                except: pass
 
-                # 2. ODSTRANĚNÍ ČEŠTINY A VYČIŠTĚNÍ
-                # Normalizace rozdělí znaky (např. 'č' na 'c' + háček)
-                normalized = unicodedata.normalize('NFKD', filename)
-                # Encode do ASCII zahodí (ignore) znaky, co nejsou ASCII (tím zmizí háčky/čárky)
-                filename_ascii = normalized.encode('ASCII', 'ignore').decode('ASCII')
-                # Regulární výraz: povolí jen písmena, čísla, tečku, pomlčku a podtržítko
-                # Vše ostatní (včetně mezer) nahradí podtržítkem nebo odstraní
-                filename_clean = re.sub(r'[^\w\.-]', '_', filename_ascii)
+                norm = unicodedata.normalize('NFKD', filename)
+                ascii_name = norm.encode('ASCII', 'ignore').decode('ASCII')
+                clean_name = re.sub(r'[^\w\.-]', '_', ascii_name)
                 
-                # Odstranění vícenásobných podtržítek vzniklých čištěním
-                filename_clean = re.sub(r'_+', '_', filename_clean)
-
-                _LOGGER.info(f'Original filename: {filename} -> Cleaned: {filename_clean}')
-
                 payload = part.get_payload(decode=True)
-                if payload is None:
-                    continue
-
-                fullpath = os.path.join(storage_path, filename_clean)
-                
-                try:
+                if payload:
+                    fullpath = os.path.join(self._storage_path, clean_name)
                     with open(fullpath, 'wb') as f:
                         f.write(payload)
                     
-                    attachments.append(fullpath)
+                    if clean_name.lower().endswith(('.xls', '.xlsx')):
+                        self._processor.process_excel(fullpath)
 
-                    # Logika pro Pandas (Excel -> CSV)
-                    if filename_clean.lower().endswith(('.xls', '.xlsx')):
-                        try:
-                            # POZOR: Pandas musí číst ten nový "vyčištěný" název souboru
-                            read_file = pd.read_excel(fullpath)
-                            output_csv_path = os.path.join(storage_path, csv_filename)
-                            read_file.to_csv(output_csv_path, index=None, header=True, sep=';')
-                        except Exception as e:
-                            _LOGGER.error(f"Pandas conversion failed: {e}")
 
-                except Exception as e:
-                    _LOGGER.error(f"Failed to save file {fullpath}: {e}")
+class EmailContentSensor(Entity):
+    """Hlavní sensor."""
 
-        return attachments
+    def __init__(self, hass, reader, processor, name, allowed_senders, email_interval):
+        self.hass = hass
+        self._reader = reader
+        self._processor = processor
+        self._name = name
+        self._allowed_senders = [s.upper() for s in allowed_senders]
+        
+        # Konfigurace intervalu
+        self._email_check_interval = datetime.timedelta(minutes=email_interval)
+        # Nastavíme minulost, aby se stahovalo hned po startu
+        self._last_email_check = datetime.datetime.min 
+        
+        self._state = "Unknown"
+        self._attributes = {}
 
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def state(self):
+        return self._state
+
+    @property
+    def extra_state_attributes(self):
+        return self._attributes
 
     def update(self):
-        _LOGGER.info('Update emails started')
-        email_message = self._email_reader.read_next()
+        """Tato metoda se volá každých cca 30 sekund."""
+        now = datetime.datetime.now()
 
-        if email_message is None:
-            # Necháme stav, jaký byl, nebo nastavíme prázdné
-            return
-
-        if self.sender_allowed(email_message):
-            # Zpracování textu/šablony
-            message_subject = EmailContentSensor.get_msg_subject(email_message)
-            
-            # Uložíme si cesty k přílohám jednou, ať nevoláme náročný Pandas 2x
-            paths = EmailContentSensor.get_msg_attachments(email_message, self._storage_path, self._csv_filename)
-
-            if self._value_template is not None:
-                message_state = self.render_template(email_message)
-            else:
-                message_state = message_subject
-
-            self._message = message_state
-            
-            # Naplnění atributů
-            self._attr_extra_state_attributes = {
-                ATTR_FROM: EmailContentSensor.get_msg_sender(email_message),
-                ATTR_SUBJECT: message_subject,
-                ATTR_DATE: email_message["Date"],
-                ATTR_NUM_ATTACHMENTS: EmailContentSensor.get_num_msg_attachments(email_message),
-                ATTR_ATTACHMENT_PATHS: paths,
-            }
-            #ATTR_BODY: EmailContentSensor.get_msg_text(email_message),
-
-            # Bezpečné smazání/přesun - zabaleno do try-except, aby nezpůsobilo "Error" sensoru
-            try:
-                _LOGGER.info(f'Deleting message UID: {self._email_reader._last_uid}')
-                # Zkusíme označit jako smazané (nejuniverzálnější metoda)
-                # self._email_reader.connection.uid("STORE", self._email_reader._last_uid, "+FLAGS", r"(\Deleted)")
-                # self._email_reader.connection.expunge()
-                self._email_reader.connection.uid("COPY", self._email_reader._last_uid, '"[Gmail]/Trash"')
-                self._email_reader.connection.uid("STORE", self._email_reader._last_uid, "+FLAGS", r"(\Deleted)")
-                self._email_reader.connection.expunge()
-
-            except Exception as e:
-                _LOGGER.warning(f"Could not delete email: {e}")
+        # 1. ČÁST: KONTROLA EMAILU (dle intervalu)
+        if now - self._last_email_check > self._email_check_interval:
+            _LOGGER.info(f"Time for scheduled email check (Interval: {self._email_check_interval})")
+            # Zde probíhá skutečné připojení k serveru
+            self._reader.check_for_emails()
+            self._last_email_check = now
+        
+        # 2. ČÁST: PŘEPOČET TARIFU (vždy)
+        state_val, interval_info = self._processor.get_current_state()
+        
+        self._state = state_val
+        self._attributes = {
+            "info": interval_info,
+            "last_email_check": self._last_email_check.isoformat(),
+            "next_email_check": (self._last_email_check + self._email_check_interval).isoformat()
+        }
+        
