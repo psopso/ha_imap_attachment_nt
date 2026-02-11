@@ -1,4 +1,4 @@
-# Home Assistant – ČEZ Tariff Sensor (IMAP)
+# Home Assistant – ČEZ Tariff Sensor (IMAP, xlsx)
 
 Tato integrace automatizuje sledování nízkého tarifu (HDO) na základě e-mailových exportů od společnosti ČEZ. Už nemusíte ručně hlídat časy v Excelu – senzor to udělá za vás.
 
